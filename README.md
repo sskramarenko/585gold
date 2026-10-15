@@ -91,13 +91,26 @@
 | Переменная | Значение |
 |---|---|
 | `AI_API_KEY` | ключ (обязательно) |
-| `AI_PROVIDER` | `anthropic` (по умолчанию) или `openai` для любого OpenAI-совместимого API |
+| `AI_PROVIDER` | `anthropic` (по умолчанию), `gigachat` или `openai` для любого OpenAI-совместимого API |
 | `AI_MODEL` | имя модели |
 | `AI_BASE_URL` | адрес API провайдера |
 | `AI_AUTH_SCHEME` | схема заголовка, по умолчанию `Bearer` |
+| `AI_SCOPE` | только GigaChat: `GIGACHAT_API_PERS` (физлицо), `_B2B`, `_CORP` |
+| `AI_INSECURE_SSL` | `1` — не проверять сертификат (для GigaChat без сертификатов Минцифры) |
 | `AI_ADMINS_ONLY` | `1` — доступ только руководителям |
 
 ### Готовые наборы
+
+**GigaChat (Сбер)** — бесплатно для физлиц: 365 млн токенов на 12 месяцев
+```
+AI_PROVIDER=gigachat
+AI_API_KEY=<ключ авторизации из личного кабинета, строка Basic>
+AI_MODEL=GigaChat-2
+AI_SCOPE=GIGACHAT_API_PERS
+```
+Бот сам получает и обновляет 30-минутный токен. Если в логах ошибка сертификата —
+добавьте `AI_INSECURE_SSL=1` либо установите на сервере сертификаты НУЦ Минцифры.
+Для юрлица вместо `GIGACHAT_API_PERS` ставится `GIGACHAT_API_B2B` или `GIGACHAT_API_CORP`.
 
 **Claude**
 ```

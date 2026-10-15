@@ -21,6 +21,7 @@ import logging
 import os
 import random
 import re
+import uuid
 from calendar import monthrange
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -62,7 +63,9 @@ AI_PROVIDER = os.getenv("AI_PROVIDER", "anthropic").strip().lower()
 AI_MODEL = os.getenv("AI_MODEL", "").strip()
 AI_BASE_URL = os.getenv("AI_BASE_URL", "").strip()
 AI_ADMINS_ONLY = os.getenv("AI_ADMINS_ONLY", "0") == "1"
-AI_AUTH_SCHEME = os.getenv("AI_AUTH_SCHEME", "Bearer").strip()  # Яндексу нужен Api-Key
+AI_AUTH_SCHEME = os.getenv("AI_AUTH_SCHEME", "Bearer").strip()   # Яндексу нужен Api-Key
+AI_SCOPE = os.getenv("AI_SCOPE", "GIGACHAT_API_PERS").strip()    # GigaChat: PERS / B2B / CORP
+AI_INSECURE = os.getenv("AI_INSECURE_SSL", "0") == "1"           # если сервис ругается на сертификат
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("cb-bot")
@@ -1080,13 +1083,47 @@ AI_SYSTEM = (
 ai_history: dict[int, list] = {}
 
 
+_giga_token = {"value": "", "until": 0.0}
+
+
+async def gigachat_token() -> str:
+    """Токен GigaChat живёт 30 минут — держим его в памяти и обновляем по истечении."""
+    import time
+    if _giga_token["value"] and time.time() < _giga_token["until"] - 60:
+        return _giga_token["value"]
+
+    url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
+        "RqUID": str(uuid.uuid4()),
+        "Authorization": f"Basic {AI_KEY}",
+    }
+    conn = aiohttp.TCPConnector(ssl=False) if AI_INSECURE else None
+    async with aiohttp.ClientSession(connector=conn) as s:
+        async with s.post(url, headers=headers, data={"scope": AI_SCOPE},
+                          timeout=aiohttp.ClientTimeout(total=30)) as r:
+            body = await r.json()
+    if "access_token" not in body:
+        raise RuntimeError(f"GigaChat не выдал токен: {str(body)[:200]}")
+    _giga_token["value"] = body["access_token"]
+    _giga_token["until"] = body.get("expires_at", 0) / 1000 or (time.time() + 1500)
+    return _giga_token["value"]
+
+
 async def ask_ai(question: str, chat_id: int) -> str:
     history = ai_history.setdefault(chat_id, [])
     history.append({"role": "user", "content": question})
     del history[:-8]
 
     try:
-        if AI_PROVIDER == "anthropic":
+        if AI_PROVIDER == "gigachat":
+            token = await gigachat_token()
+            url = (AI_BASE_URL or "https://api.giga.chat/v1") + "/chat/completions"
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            payload = {"model": AI_MODEL or "GigaChat-2", "max_tokens": 800,
+                       "messages": [{"role": "system", "content": AI_SYSTEM}] + history}
+        elif AI_PROVIDER == "anthropic":
             url = (AI_BASE_URL or "https://api.anthropic.com") + "/v1/messages"
             headers = {"x-api-key": AI_KEY, "anthropic-version": "2023-06-01",
                        "content-type": "application/json"}
@@ -1098,7 +1135,8 @@ async def ask_ai(question: str, chat_id: int) -> str:
             payload = {"model": AI_MODEL or "gpt-4o-mini", "max_tokens": 800,
                        "messages": [{"role": "system", "content": AI_SYSTEM}] + history}
 
-        async with aiohttp.ClientSession() as s:
+        conn = aiohttp.TCPConnector(ssl=False) if AI_INSECURE else None
+        async with aiohttp.ClientSession(connector=conn) as s:
             async with s.post(url, headers=headers, json=payload,
                               timeout=aiohttp.ClientTimeout(total=90)) as r:
                 body = await r.json()
