@@ -35,8 +35,8 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramNetworkError
 from aiogram.filters import Command, CommandStart
-from aiogram.types import (CallbackQuery, ErrorEvent, InlineKeyboardButton,
-                           InlineKeyboardMarkup, Message)
+from aiogram.types import (BufferedInputFile, CallbackQuery, ErrorEvent,
+                           InlineKeyboardButton, InlineKeyboardMarkup, Message)
 
 # ---------------------------------------------------------------- настройки
 
@@ -57,6 +57,10 @@ ALLOWED_CHATS = {int(x) for x in os.getenv("ALLOWED_CHATS", "").replace(" ", "")
                  if x.lstrip("-").isdigit()}
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",")
              if x.isdigit()}
+# Куда складывать резервные копии: личка с ботом у первого руководителя.
+# Хостинг стирает файлы при каждой пересборке, поэтому память живёт в телеграме.
+STORAGE_CHAT = int(os.getenv("STORAGE_CHAT", "0") or 0) or (min(ADMIN_IDS) if ADMIN_IDS else 0)
+BACKUP_EVERY_SEC = 120        # как часто проверять, не пора ли сохраниться
 
 # ИИ-помощник: работает, если задан ключ
 AI_KEY = os.getenv("AI_API_KEY", "").strip()
@@ -114,11 +118,34 @@ def strip_seps(text: str) -> str:
     return text.lstrip(SEPARATORS + " ").strip()
 
 
+def employee_by_nick(nick: str) -> str | None:
+    """Ищет сотрудника по телеграм-нику среди привязок."""
+    nick = nick.strip().lstrip("@").lower()
+    if not nick:
+        return None
+    pre = data.get("nicks", {}).get(nick)
+    if pre in EMPLOYEES:
+        return pre
+    for uid, n in data.get("tg", {}).items():
+        if n.lower() == nick:
+            bound = data.get("bind", {}).get(uid)
+            if bound in EMPLOYEES:
+                return bound
+    return None
+
+
 def match_employees(text: str) -> list[str]:
-    """Все сотрудники, подходящие под кусок имени."""
+    """Все сотрудники, подходящие под кусок имени или телеграм-ник."""
+    raw = text.strip()
+    by_nick = employee_by_nick(raw)
+    if by_nick:
+        return [by_nick]
     t = _norm(text)
     if not t:
         return []
+    by_nick = employee_by_nick(t.replace(" ", "_"))
+    if by_nick:
+        return [by_nick]
     found = []
     for name, aliases in EMPLOYEES.items():
         if t == _norm(name):
@@ -218,16 +245,26 @@ def now_msk() -> datetime:
 
 def load_data() -> None:
     global data
-    if DATA_FILE.exists():
-        try:
-            data = {**DEFAULT_DATA, **json.loads(DATA_FILE.read_text(encoding="utf-8"))}
-            return
-        except Exception as e:
-            log.warning("Не прочитать данные: %s", e)
+    for path in (DATA_FILE, BASE_DIR / "seed_data.json"):
+        if path.exists():
+            try:
+                data = {**DEFAULT_DATA, **json.loads(path.read_text(encoding="utf-8"))}
+                log.info("Данные загружены из %s: поручений %s, карт KPI %s",
+                         path.name, len(data.get("tasks", [])), len(data.get("kpi", {})))
+                if path.name == "seed_data.json":
+                    save_data()      # дальше работаем уже со своим файлом
+                return
+            except Exception as e:
+                log.warning("Не прочитать %s: %s", path.name, e)
     data = dict(DEFAULT_DATA)
+    log.info("Начинаю с пустыми данными")
+
+
+DIRTY = {"flag": False}
 
 
 def save_data() -> None:
+    DIRTY["flag"] = True
     try:
         DATA_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
     except Exception as e:
@@ -489,6 +526,63 @@ async def cmd_bind(message: Message):
     await message.answer(f"{target_label or target_id} — это <b>{emp}</b>, запомнил.")
 
 
+@router.message(Command("export", "бэкап"))
+async def cmd_export(message: Message):
+    """Выгрузить все данные бота одним файлом."""
+    remember(message)
+    if not is_admin(message.from_user.id):
+        await message.answer("Выгрузку делают руководители.")
+        return
+    save_data()
+    await backup_to_telegram(message.bot, "копия по команде /export")
+    payload = data_bytes()
+    stamp = now_msk().strftime("%Y-%m-%d_%H%M")
+    await message.answer_document(
+        BufferedInputFile(payload, filename=f"cb_data_{stamp}.json"),
+        caption=(f"💾 <b>Резервная копия</b>\n"
+                 f"Поручений: {len(data.get('tasks', []))} · "
+                 f"карт KPI: {len(data.get('kpi', {}))} · "
+                 f"отпусков: {len(data.get('vacations', []))}\n\n"
+                 f"Восстановить: отправьте этот файл в чат и ответьте на него "
+                 f"командой <code>/import</code>"),
+    )
+
+
+@router.message(Command("import", "восстановить"))
+async def cmd_import(message: Message):
+    """Восстановить данные из файла: команда ответом на присланный json."""
+    remember(message)
+    if not is_admin(message.from_user.id):
+        await message.answer("Восстановление делают руководители.")
+        return
+    doc = message.reply_to_message.document if message.reply_to_message else None
+    if not doc:
+        await message.answer(
+            "Отправьте в чат файл резервной копии и ответьте на него командой "
+            "<code>/import</code>.\n\nСделать копию: /export"
+        )
+        return
+    try:
+        buf = await message.bot.download(doc)
+        loaded = json.loads(buf.read().decode("utf-8"))
+        if not isinstance(loaded, dict) or "tasks" not in loaded:
+            raise ValueError("не похоже на копию данных бота")
+    except Exception as e:
+        await message.answer(f"Не смог прочитать файл: {e}")
+        return
+
+    global data
+    before = len(data.get("tasks", []))
+    data = {**DEFAULT_DATA, **loaded}
+    save_data()
+    await backup_to_telegram(message.bot, "после /import")
+    await message.answer(
+        f"♻️ <b>Данные восстановлены</b>\n"
+        f"Было поручений: {before}, стало: {len(data.get('tasks', []))}\n"
+        f"Карт KPI: {len(data.get('kpi', {}))} · отпусков: {len(data.get('vacations', []))}"
+    )
+
+
 @router.message(Command("team", "кто_есть"))
 async def cmd_team(message: Message):
     """Кого бот узнаёт в лицо."""
@@ -529,16 +623,31 @@ async def cmd_task(message: Message):
 
     body = strip_seps(raw[1])
     deadline, body_wo = None, body
-    m = re.search(r"\s+до\s+(.+?)\s*$", body, re.I)
-    if m:
-        deadline = parse_date(m.group(1))
-        if deadline:
-            body_wo = body[:m.start()].strip()
+    date_re = (r"(\d{1,2}[.\-/]\d{1,2}(?:[.\-/]\d{2,4})?"
+               r"|\d{1,2}\s+[а-я]{3,}\.?(?:\s+\d{4})?"
+               r"|сегодня|завтра|послезавтра|через\s+\d+\s*дн\w*)")
+    for marker in (r"\bдо\s+", r"\bк\s+", r"\bсрок[а-я]*\s*[:—-]?\s*"):
+        m = re.search(marker + date_re, body, re.I)
+        if m and parse_date(m.group(1)):
+            deadline = parse_date(m.group(1))
+            # срок в самом конце — убираем из текста, в середине — оставляем как есть
+            if m.end() >= len(body.rstrip(". ")) - 1:
+                body_wo = body[:m.start()].strip(" .,")
+            break
 
     assignees, what, variants = take_employees(body_wo)
     if not assignees:
-        remember_pending(message, body_wo.split()[0] if body_wo.split() else "", "task")
-        await message.answer(ask_who(variants, body_wo.split()[0] if body_wo.split() else "?"))
+        first = body_wo.split()[0] if body_wo.split() else "?"
+        if first.startswith("@") or "_" in first:
+            nick = first.lstrip("@")
+            await message.answer(
+                f"Не знаю, кто такой @{nick}.\n\n"
+                f"Привяжите ник к сотруднику: <code>/bind @{nick} Света</code>\n"
+                f"Или поставьте поручение по имени: <code>/task Света …</code>"
+            )
+            return
+        remember_pending(message, first, "task")
+        await message.answer(ask_who(variants, first))
         return
     if not what:
         await message.answer("Не понял, что поручаем. Пример: <code>/task Оля свести оклады до 20.10</code>")
@@ -655,6 +764,7 @@ async def cmd_closed(message: Message):
                      f"     <i>{', '.join(t['who'])} · закрыто {fmt_date(closed)} · {tail}</i>")
     head = f"📗 <b>Закрытые поручения" + (f": {emp_filter}" if emp_filter else "") + f"</b>\n"
     head += f"Всего {len(done)}, в срок {in_time} из {min(len(done), 30)} показанных\n"
+    head += "<i>Вернуть в работу: /reopen номер</i>\n"
     await message.answer(head + "\n" + "\n".join(lines))
 
 
@@ -747,6 +857,57 @@ async def cmd_postpone(message: Message):
     t["overdue_at"] = ""
     save_data()
     await message.answer(f"📅 <b>№{t['id']}</b>: срок перенесён с {old} на <b>{fmt_date(new_date)}</b>")
+
+
+@router.message(Command("reopen", "вернуть"))
+async def cmd_reopen(message: Message):
+    """Переоткрыть закрытое поручение: /reopen 3 [до 30.10]"""
+    remember(message)
+    if not is_admin(message.from_user.id):
+        await message.answer("Возвращать поручения в работу могут руководители.")
+        return
+    m = re.match(r"^\S+\s+№?(\d+)(?:\s+(?:до|к)?\s*(.+))?$", (message.text or "").strip())
+    if not m:
+        await message.answer("Напишите так: <code>/reopen 3</code> или <code>/reopen 3 до 30.10</code>")
+        return
+
+    t = next((x for x in data["tasks"] if x["id"] == int(m.group(1))), None)
+    if not t:
+        await message.answer(f"Поручения №{m.group(1)} не нашёл.")
+        return
+    if not t["done"]:
+        await message.answer(f"Поручение №{t['id']} и так в работе — срок {fmt_date(t['deadline'])}.")
+        return
+
+    t["done"] = False
+    t["warned"] = False
+    t["overdue_at"] = ""
+    closed_by = t.pop("closed_by", None)
+    t.pop("closed_at", None)
+
+    tail = ""
+    if m.group(2):
+        new_date = parse_date(m.group(2).strip())
+        if new_date:
+            t["deadline"] = new_date.strftime("%Y-%m-%d")
+            tail = f"\nНовый срок: <b>{fmt_date(new_date)}</b>"
+        else:
+            tail = "\n<i>Дату не понял, срок оставил прежним.</i>"
+    save_data()
+
+    left = (datetime.strptime(t["deadline"], "%Y-%m-%d").date() - now_msk().date()).days
+    when = f"{left} дн." if left >= 0 else f"просрочено на {-left} дн."
+    await message.answer(
+        f"🔄 <b>Поручение №{t['id']} снова в работе</b>\n\n{t['what']}\n\n"
+        f"Кому: <b>{', '.join(t['who'])}</b>\n"
+        f"Срок: <b>{fmt_date(t['deadline'])}</b> ({when}){tail}\n"
+        + (f"<i>Ранее закрывал(а): {closed_by}</i>\n" if closed_by else "")
+        + f"\nВернул(а) в работу: {uname(message)}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Выполнено", callback_data=f"t:done:{t['id']}"),
+            InlineKeyboardButton(text="📅 +3 дня", callback_data=f"t:post:{t['id']}"),
+        ]]),
+    )
 
 
 @router.message(Command("cancel", "снять"))
@@ -1614,6 +1775,7 @@ HELP = (
     "    нескольким сразу: <code>/task Максим, Вика Г., Света отчёт до 19 окт</code>\n"
     "/tasks — открытые · /my — свои · /closed — закрытые\n"
     "/done 3 — закрыть · /extend 3 до 25.10 · /cancel 3\n"
+    "/reopen 3 — вернуть закрытое в работу (руководитель)\n"
     "<i>Закрыть и продлить может исполнитель или руководитель.</i>\n\n"
     "<b>Премии и KPI</b>\n"
     "/card — сводка · <code>/card Оля</code> — подробно\n"
@@ -1634,7 +1796,8 @@ HELP = (
     "/game — «5 букв» · /score — счёт\n"
     "/ask — спросить помощника · /reset — очистить контекст\n"
     "/whoami — мои права · /chatid — id чата\n"
-    "/iam Вика Г. — представиться · /team — кого бот узнаёт\n\n"
+    "/iam Вика Г. — представиться · /team — кого бот узнаёт\n"
+    "/export — резервная копия данных · /import — восстановить\n\n"
     "<i>Имя можно писать как угодно: «Оля», «вика к», «кудряшова». "
     "Если неоднозначно — просто ответьте именем, команда повторится сама.</i>"
 )
@@ -1720,6 +1883,74 @@ REDISPATCH = {
     "plan": cmd_plan, "план": cmd_plan,
     "fact": cmd_fact, "факт": cmd_fact,
 }
+
+# ---------------------------------------------------------------- память в телеграме
+
+
+def data_bytes() -> bytes:
+    return json.dumps(data, ensure_ascii=False, indent=1).encode("utf-8")
+
+
+async def backup_to_telegram(bot: Bot, reason: str = "") -> bool:
+    """Отправляет копию данных в хранилище и закрепляет её там."""
+    if not STORAGE_CHAT:
+        return False
+    try:
+        stamp = now_msk().strftime("%d.%m.%Y %H:%M")
+        sent = await bot.send_document(
+            STORAGE_CHAT,
+            BufferedInputFile(data_bytes(), filename="cb_data.json"),
+            caption=(f"💾 Память бота · {stamp}\n"
+                     f"поручений {len(data.get('tasks', []))}, "
+                     f"карт KPI {len(data.get('kpi', {}))}, "
+                     f"привязок {len(data.get('bind', {}))}"
+                     + (f"\n{reason}" if reason else "")),
+            disable_notification=True,
+        )
+        try:
+            await bot.unpin_all_chat_messages(STORAGE_CHAT)
+        except Exception:
+            pass
+        await bot.pin_chat_message(STORAGE_CHAT, sent.message_id, disable_notification=True)
+        DIRTY["flag"] = False
+        log.info("Копия данных сохранена в телеграм")
+        return True
+    except Exception as e:
+        log.warning("Копию в телеграм не отправить: %s", e)
+        return False
+
+
+async def restore_from_telegram(bot: Bot) -> bool:
+    """Поднимает данные из закреплённой копии — после пересборки хостинга."""
+    global data
+    if not STORAGE_CHAT:
+        return False
+    try:
+        chat = await bot.get_chat(STORAGE_CHAT)
+        pinned = getattr(chat, "pinned_message", None)
+        if not pinned or not pinned.document:
+            log.info("В хранилище нет закреплённой копии")
+            return False
+        buf = await bot.download(pinned.document)
+        loaded = json.loads(buf.read().decode("utf-8"))
+        if not isinstance(loaded, dict) or "tasks" not in loaded:
+            return False
+        data = {**DEFAULT_DATA, **loaded}
+        DATA_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+        log.info("Данные восстановлены из телеграма: поручений %s, карт KPI %s",
+                 len(data.get("tasks", [])), len(data.get("kpi", {})))
+        return True
+    except Exception as e:
+        log.warning("Не восстановить из телеграма: %s", e)
+        return False
+
+
+async def backup_loop(bot: Bot) -> None:
+    while True:
+        await asyncio.sleep(BACKUP_EVERY_SEC)
+        if DIRTY["flag"]:
+            await backup_to_telegram(bot)
+
 
 # ---------------------------------------------------------------- расписание
 
@@ -1892,6 +2123,10 @@ async def main() -> None:
     dp.include_router(router)
     dp.errors.register(on_error)
 
+    if not data.get("tasks") and not data.get("kpi"):
+        await restore_from_telegram(bot)
+    asyncio.create_task(backup_loop(bot))
+    log.info("Хранилище копий: %s", STORAGE_CHAT or "не задано (ADMIN_IDS пуст)")
     log.info("Сотрудников: %s · с премией: %s · слов: %s",
              len(EMPLOYEES), len(PREMIUM_STAFF), len(SECRET_WORDS))
     log.info("Разрешённые чаты: %s · руководители: %s",
