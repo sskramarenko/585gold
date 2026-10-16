@@ -80,7 +80,8 @@ MONTHS = ("января февраля марта апреля мая июня �
 EMPLOYEES = {
     "Сергей":  ["сергей", "серёжа", "сережа", "sergey"],
     "Максим":  ["максим", "макс", "арбузов"],
-    "Вика Г.": ["вика г", "викаг", "гандрабура", "виктория г"],
+    "Вика Г.": ["вика г", "викаг", "гандрабура", "виктория г",
+                "viktoriia_gvv", "viktoriia", "viktoria_g", "vika_g"],
     "Вика К.": ["вика к", "викак", "кудряшова", "виктория к"],
     "Света":   ["света", "светлана", "сенькина"],
     "Лёша":    ["лёша", "леша", "алексей", "звягинцев"],
@@ -99,7 +100,7 @@ KPI_TEMPLATE = [
 ]
 
 
-SEPARATORS = "-–—:;,.!|/\\>«»\"'()[]"
+SEPARATORS = "-–—:;,.!|/\\>«»\"'()[]@"
 
 
 def _norm(t: str) -> str:
@@ -201,6 +202,8 @@ DEFAULT_DATA = {
     "dayoffs": [],        # заявки на отгул
     "scores": {},         # «5 букв»
     "users": {},          # user_id -> имя в телеграме
+    "tg": {},             # user_id -> @ник
+    "bind": {},           # user_id -> сотрудник из списка
     "chats": [],          # где бот прописан
     "done": {},           # отметки «уже напоминал»
     "next_id": 1,
@@ -244,7 +247,16 @@ def uname(obj) -> str:
 def remember(obj) -> None:
     u = obj.from_user
     if u and not u.is_bot:
-        data["users"][str(u.id)] = u.first_name or u.username or "Коллега"
+        uid = str(u.id)
+        data["users"][uid] = u.first_name or u.username or "Коллега"
+        if u.username:
+            data["tg"][uid] = u.username
+        if uid not in data["bind"]:         # пробуем узнать человека сами
+            guess = (match_employee(u.username or "")
+                     or match_employee(f"{u.first_name or ''} {u.last_name or ''}")
+                     or match_employee(u.first_name or ""))
+            if guess:
+                data["bind"][uid] = guess
     chat = getattr(obj, "chat", None) or obj.message.chat
     if chat.id not in data["chats"] and chat.type in ("group", "supergroup"):
         data["chats"].append(chat.id)
@@ -355,11 +367,82 @@ async def cmd_chatid(message: Message):
 
 @router.message(Command("whoami"))
 async def cmd_whoami(message: Message):
+    remember(message)
+    save_data()
     uid = message.from_user.id
+    emp = my_name(uid)
+    nick = data["tg"].get(str(uid))
     await message.answer(
-        f"Вы <b>{uname(message)}</b>, id <code>{uid}</code>\n"
+        f"Вы <b>{uname(message)}</b>" + (f" (@{nick})" if nick else "") + f", id <code>{uid}</code>\n"
+        f"В списке отдела: <b>{emp or 'не узнаю'}</b>\n"
         f"Права руководителя: {'да' if is_admin(uid) else 'нет'}"
+        + ("" if emp else "\n\nПредставьтесь: <code>/iam Вика Г.</code> — "
+                          "тогда сможете закрывать свои поручения.")
     )
+
+
+@router.message(Command("iam", "это_я"))
+async def cmd_iam(message: Message):
+    """Привязка своего аккаунта к сотруднику из списка."""
+    remember(message)
+    body = (message.text or "").split(maxsplit=1)
+    if len(body) < 2:
+        await message.answer(
+            "Напишите, кто вы из списка: <code>/iam Вика Г.</code>\n"
+            f"Известные: {', '.join(EMPLOYEES)}"
+        )
+        return
+    emp, _, variants = take_employee(body[1])
+    if not emp:
+        await message.answer(ask_who(variants, body[1]))
+        return
+    data["bind"][str(message.from_user.id)] = emp
+    save_data()
+    await message.answer(f"Запомнил: вы <b>{emp}</b>. Теперь свои поручения можно закрывать.")
+
+
+@router.message(Command("bind"))
+async def cmd_bind(message: Message):
+    """Руководитель привязывает чужой аккаунт: /bind @nick Вика Г."""
+    remember(message)
+    if not is_admin(message.from_user.id):
+        await message.answer("Привязывать чужие аккаунты могут руководители.")
+        return
+    body = (message.text or "").split(maxsplit=2)
+    if len(body) < 3:
+        await message.answer("Напишите так: <code>/bind @Viktoriia_GVV Вика Г.</code>")
+        return
+    nick = body[1].lstrip("@").strip()
+    emp, _, variants = take_employee(body[2])
+    if not emp:
+        await message.answer(ask_who(variants, body[2]))
+        return
+    uid = next((u for u, n in data["tg"].items() if n.lower() == nick.lower()), None)
+    if not uid:
+        await message.answer(
+            f"Пока не видел @{nick} в этом чате — пусть напишет любое сообщение, "
+            f"и повторите команду. Либо он сам: <code>/iam {emp}</code>"
+        )
+        return
+    data["bind"][uid] = emp
+    save_data()
+    await message.answer(f"@{nick} — это <b>{emp}</b>, запомнил.")
+
+
+@router.message(Command("team", "кто_есть"))
+async def cmd_team(message: Message):
+    """Кого бот узнаёт в лицо."""
+    lines = ["👥 <b>Сотрудники отдела</b>\n"]
+    for emp in EMPLOYEES:
+        uid = next((u for u, e in data["bind"].items() if e == emp), None)
+        if uid:
+            nick = data["tg"].get(uid)
+            lines.append(f"✅ <b>{emp}</b>" + (f" — @{nick}" if nick else f" — {data['users'].get(uid, '')}"))
+        else:
+            lines.append(f"⬜ <b>{emp}</b> — аккаунт не привязан")
+    lines.append("\n<i>Непривязанный не сможет сам закрыть своё поручение.</i>\n"
+                 "Привязать: <code>/iam Вика Г.</code> или <code>/bind @ник Вика Г.</code>")
+    await message.answer("\n".join(lines))
 
 # ---------------------------------------------------------------- поручения
 
@@ -523,8 +606,17 @@ async def cmd_my_tasks(message: Message):
 
 
 def my_name(user_id: int) -> str | None:
-    """Сопоставляет телеграм-аккаунт с сотрудником из списка."""
-    return match_employee(data["users"].get(str(user_id), ""))
+    """Кто это из сотрудников: по ручной привязке, нику или имени в телеграме."""
+    uid = str(user_id)
+    bound = data.get("bind", {}).get(uid)
+    if bound in EMPLOYEES:
+        return bound
+    nick = data.get("tg", {}).get(uid)
+    if nick:
+        emp = match_employee(nick)
+        if emp:
+            return emp
+    return match_employee(data["users"].get(uid, ""))
 
 
 def may_touch(task: dict, user_id: int) -> bool:
@@ -1477,7 +1569,8 @@ HELP = (
     "<b>Разное</b>\n"
     "/game — «5 букв» · /score — счёт\n"
     "/ask — спросить помощника · /reset — очистить контекст\n"
-    "/whoami — мои права · /chatid — id чата\n\n"
+    "/whoami — мои права · /chatid — id чата\n"
+    "/iam Вика Г. — представиться · /team — кого бот узнаёт\n\n"
     "<i>Имя можно писать как угодно: «Оля», «вика к», «кудряшова». "
     "Если неоднозначно — просто ответьте именем, команда повторится сама.</i>"
 )
