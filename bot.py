@@ -49,7 +49,7 @@ MORNING_HOUR = 10           # час утренних напоминаний (М
 THANKS_SUMMARY_WEEKDAY = 4  # пятница — итоги благодарностей
 THANKS_SUMMARY_HOUR = 17
 
-VERSION = "2026-10-16 · 16:10"   # видно в логах и по команде /version
+VERSION = "2026-10-16 · 17:15"   # видно в логах и по команде /version
 
 MSK = timezone(timedelta(hours=3))
 BASE_DIR = Path(__file__).resolve().parent
@@ -245,16 +245,18 @@ def now_msk() -> datetime:
     return datetime.now(MSK)
 
 
+DATA_SOURCE = {"from": "empty"}
+
+
 def load_data() -> None:
     global data
     for path in (DATA_FILE, BASE_DIR / "seed_data.json"):
         if path.exists():
             try:
                 data = {**DEFAULT_DATA, **json.loads(path.read_text(encoding="utf-8"))}
+                DATA_SOURCE["from"] = "disk" if path is DATA_FILE else "seed"
                 log.info("Данные загружены из %s: поручений %s, карт KPI %s",
                          path.name, len(data.get("tasks", [])), len(data.get("kpi", {})))
-                if path.name == "seed_data.json":
-                    save_data()      # дальше работаем уже со своим файлом
                 return
             except Exception as e:
                 log.warning("Не прочитать %s: %s", path.name, e)
@@ -740,16 +742,41 @@ def task_line(t: dict) -> str:
 
 @router.message(Command("tasks", "задачи", "поручения"))
 async def cmd_tasks(message: Message):
+    """Все открытые поручения или только по одному сотруднику: /tasks Света"""
+    remember(message)
+    parts = (message.text or "").split(maxsplit=1)
+    emp = None
+    if len(parts) > 1:
+        emp, _, variants = take_employee(parts[1])
+        if not emp:
+            await message.answer(ask_who(variants, parts[1].strip()))
+            return
+
     open_tasks = [t for t in data["tasks"] if not t["done"]]
+    if emp:
+        open_tasks = [t for t in open_tasks if emp in t["who"]]
     if not open_tasks:
-        await message.answer("Открытых поручений нет 🎉")
+        await message.answer(
+            f"У {emp} открытых поручений нет 👍" if emp else "Открытых поручений нет 🎉"
+        )
         return
+
     open_tasks.sort(key=lambda t: t["deadline"])
-    overdue = [t for t in open_tasks if datetime.strptime(t["deadline"], "%Y-%m-%d").date() < now_msk().date()]
-    head = f"📋 <b>Открытые поручения: {len(open_tasks)}</b>"
+    today = now_msk().date()
+    overdue = [t for t in open_tasks
+               if datetime.strptime(t["deadline"], "%Y-%m-%d").date() < today]
+    head = (f"📋 <b>Поручения: {emp}</b> — {len(open_tasks)}" if emp
+            else f"📋 <b>Открытые поручения: {len(open_tasks)}</b>")
     if overdue:
         head += f" · просрочено: {len(overdue)}"
-    await message.answer(head + "\n\n" + "\n".join(task_line(t) for t in open_tasks))
+    tail = ""
+    if emp:
+        closed_n = sum(1 for t in data["tasks"] if t["done"] and emp in t["who"])
+        if closed_n:
+            tail = f"\n\n<i>Закрытых у {emp}: {closed_n} — /closed {emp.split()[0]}</i>"
+    else:
+        tail = "\n\n<i>По одному человеку: /tasks Света</i>"
+    await message.answer(head + "\n\n" + "\n".join(task_line(t) for t in open_tasks) + tail)
 
 
 @router.message(Command("closed", "закрытые"))
@@ -1793,7 +1820,8 @@ HELP = (
     "<b>Поручения</b>\n"
     "/task — поставить: <code>/task Оля свести оклады до 20.10</code>\n"
     "    нескольким сразу: <code>/task Максим, Вика Г., Света отчёт до 19 окт</code>\n"
-    "/tasks — открытые · /my — свои · /closed — закрытые\n"
+    "/tasks — открытые · <code>/tasks Света</code> — по человеку\n"
+    "/my — свои · /closed — закрытые\n"
     "/done 3 — закрыть · /extend 3 до 25.10 · /cancel 3\n"
     "/reopen 3 — вернуть закрытое в работу (руководитель)\n"
     "<i>Закрыть и продлить может исполнитель или руководитель.</i>\n\n"
@@ -2143,8 +2171,13 @@ async def main() -> None:
     dp.include_router(router)
     dp.errors.register(on_error)
 
-    if not data.get("tasks") and not data.get("kpi"):
-        await restore_from_telegram(bot)
+    # Своя память на диске — главная. Если её нет (хостинг пересобрался),
+    # берём свежую копию из телеграма, и только если и там пусто — подложку из репозитория.
+    if DATA_SOURCE["from"] != "disk":
+        restored = await restore_from_telegram(bot)
+        if not restored and DATA_SOURCE["from"] == "seed":
+            save_data()
+            log.info("Копии в телеграме нет — работаем с подложкой из репозитория")
     asyncio.create_task(backup_loop(bot))
     log.info("Хранилище копий: %s", STORAGE_CHAT or "не задано (ADMIN_IDS пуст)")
     log.info("ВЕРСИЯ %s", VERSION)
