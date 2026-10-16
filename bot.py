@@ -49,6 +49,8 @@ MORNING_HOUR = 10           # час утренних напоминаний (М
 THANKS_SUMMARY_WEEKDAY = 4  # пятница — итоги благодарностей
 THANKS_SUMMARY_HOUR = 17
 
+VERSION = "2026-10-16 · 16:10"   # видно в логах и по команде /version
+
 MSK = timezone(timedelta(hours=3))
 BASE_DIR = Path(__file__).resolve().parent
 DATA_FILE = BASE_DIR / "cb_data.json"
@@ -404,6 +406,20 @@ async def cmd_chatid(message: Message):
     )
 
 
+@router.message(Command("version", "версия"))
+async def cmd_version(message: Message):
+    """Какая сборка сейчас работает и что она умеет."""
+    has_storage = "да" if STORAGE_CHAT else "нет (пуст ADMIN_IDS)"
+    await message.answer(
+        f"🔖 <b>Версия бота: {VERSION}</b>\n\n"
+        f"Поручений в памяти: {len(data.get('tasks', []))}\n"
+        f"Карт KPI: {len(data.get('kpi', {}))} · привязок: {len(data.get('bind', {}))}\n"
+        f"Хранилище копий: {has_storage}\n"
+        f"ИИ-помощник: {'подключён' if AI_KEY else 'выключен'}\n\n"
+        f"<i>Есть /export, /import, /reopen, /closed, /addkpi — значит сборка свежая.</i>"
+    )
+
+
 @router.message(Command("whoami"))
 async def cmd_whoami(message: Message):
     remember(message)
@@ -534,7 +550,7 @@ async def cmd_export(message: Message):
         await message.answer("Выгрузку делают руководители.")
         return
     save_data()
-    await backup_to_telegram(message.bot, "копия по команде /export")
+    stored = await backup_to_telegram(message.bot, "копия по команде /export")
     payload = data_bytes()
     stamp = now_msk().strftime("%Y-%m-%d_%H%M")
     await message.answer_document(
@@ -543,8 +559,12 @@ async def cmd_export(message: Message):
                  f"Поручений: {len(data.get('tasks', []))} · "
                  f"карт KPI: {len(data.get('kpi', {}))} · "
                  f"отпусков: {len(data.get('vacations', []))}\n\n"
-                 f"Восстановить: отправьте этот файл в чат и ответьте на него "
-                 f"командой <code>/import</code>"),
+                 + ("\n✅ Копия закреплена в хранилище — переживёт пересборку хостинга."
+                    if stored else
+                    "\n⚠️ В хранилище копию положить не вышло: откройте личку с ботом "
+                    "и нажмите Start.")
+                 + f"\n\nВосстановить: отправьте этот файл в чат и ответьте на него "
+                   f"командой <code>/import</code>"),
     )
 
 
@@ -2127,6 +2147,7 @@ async def main() -> None:
         await restore_from_telegram(bot)
     asyncio.create_task(backup_loop(bot))
     log.info("Хранилище копий: %s", STORAGE_CHAT or "не задано (ADMIN_IDS пуст)")
+    log.info("ВЕРСИЯ %s", VERSION)
     log.info("Сотрудников: %s · с премией: %s · слов: %s",
              len(EMPLOYEES), len(PREMIUM_STAFF), len(SECRET_WORDS))
     log.info("Разрешённые чаты: %s · руководители: %s",
