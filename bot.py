@@ -995,6 +995,10 @@ def load_words(name: str) -> list[str]:
 
 SECRET_WORDS = load_words("words_secret.txt")
 ALLOWED_WORDS = set(load_words("words_all.txt")) | set(SECRET_WORDS)
+if not SECRET_WORDS and ALLOWED_WORDS:      # нет отобранного списка — загадываем из общего
+    SECRET_WORDS = sorted(ALLOWED_WORDS)
+if not SECRET_WORDS:
+    log.warning("Словари не найдены: положите words_secret.txt и words_all.txt рядом с bot.py")
 
 
 @dataclass
@@ -1045,7 +1049,12 @@ def render_letters(game: Game) -> str:
 async def cmd_game(message: Message):
     remember(message)
     if not SECRET_WORDS:
-        await message.answer("Словарь не загружен.")
+        missing = [n for n in ("words_secret.txt", "words_all.txt") if not (BASE_DIR / n).exists()]
+        await message.answer(
+            "Словарь не загружен.\n\n"
+            + (f"Нет файлов: <code>{', '.join(missing)}</code>\n" if missing else "")
+            + "Их нужно положить в репозиторий рядом с <code>bot.py</code>."
+        )
         return
     game = games.get(message.chat.id)
     if game and not game.finished:
@@ -1142,7 +1151,8 @@ async def ask_ai(question: str, chat_id: int) -> str:
                 body = await r.json()
         if r.status >= 400:
             log.warning("ИИ вернул ошибку %s: %s", r.status, str(body)[:300])
-            return f"Сервис ответил ошибкой {r.status}. Проверьте ключ и модель."
+            return (f"Сервис ответил ошибкой <b>{r.status}</b>.\n\n"
+                    f"<code>{str(body)[:300]}</code>")
 
         if AI_PROVIDER == "anthropic":
             answer = "".join(b.get("text", "") for b in body.get("content", []))
@@ -1151,9 +1161,23 @@ async def ask_ai(question: str, chat_id: int) -> str:
         history.append({"role": "assistant", "content": answer})
         return answer.strip() or "Пустой ответ."
     except Exception as e:
-        log.warning("ИИ недоступен: %s", e)
+        log.warning("ИИ недоступен: %s: %s", type(e).__name__, e)
         history.pop()
-        return "Не смог связаться с ИИ-сервисом. Попробуйте позже."
+        detail = f"{type(e).__name__}: {e}"[:300]
+        hint = ""
+        low = detail.lower()
+        if "dns" in low or "name or service" in low or "timeout" in low:
+            hint = ("\n\nАдрес недоступен с хостинга: не резолвится или закрыт порт. "
+                    "Попробуйте другого провайдера ИИ.")
+        elif "certificate" in low or "certificate_verify" in low or "cert" in low:
+            hint = ("\n\nПохоже на сертификат. Добавьте переменную "
+                    "<code>AI_INSECURE_SSL=1</code> и перезапустите бота.")
+        elif "токен" in low or "401" in low or "unauthorized" in low:
+            hint = ("\n\nПохоже на ключ или scope. Проверьте <code>AI_API_KEY</code> "
+                    "(нужен «ключ авторизации», а не client_id) и <code>AI_SCOPE</code>.")
+        elif "connect" in low:
+            hint = "\n\nСервис не отвечает — возможно, хостинг не пускает исходящие на этот адрес."
+        return f"Не смог связаться с ИИ-сервисом.\n\n<code>{detail}</code>{hint}"
 
 
 @router.message(Command("ask", "спроси", "ai"))
