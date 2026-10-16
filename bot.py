@@ -21,6 +21,7 @@ import logging
 import os
 import random
 import re
+import time
 import uuid
 from calendar import monthrange
 from dataclasses import dataclass, field
@@ -98,8 +99,18 @@ KPI_TEMPLATE = [
 ]
 
 
+SEPARATORS = "-–—:;,.!|/\\>«»\"'()[]"
+
+
 def _norm(t: str) -> str:
-    return re.sub(r"[.,]", " ", t.strip().lower().replace("ё", "е")).strip()
+    """Имя без знаков препинания: «Вика Г.» и «- вика г:» дают одно и то же."""
+    t = t.strip().lower().replace("ё", "е")
+    return re.sub(r"\s+", " ", re.sub(f"[{re.escape(SEPARATORS)}]", " ", t)).strip()
+
+
+def strip_seps(text: str) -> str:
+    """Убирает ведущие разделители: «- Оля …», «: Оля …»."""
+    return text.lstrip(SEPARATORS + " ").strip()
 
 
 def match_employees(text: str) -> list[str]:
@@ -127,7 +138,8 @@ def match_employee(text: str) -> str | None:
 
 def take_employee(text: str) -> tuple[str | None, str, list[str]]:
     """Отрывает имя от начала строки. Возвращает (кто, остаток, варианты при неоднозначности)."""
-    words = text.strip().split()
+    text = strip_seps(text)
+    words = text.split()
     if not words:
         return None, "", []
     for n in (2, 1):
@@ -135,15 +147,45 @@ def take_employee(text: str) -> tuple[str | None, str, list[str]]:
             continue
         found = match_employees(" ".join(words[:n]))
         if len(found) == 1:
-            return found[0], " ".join(words[n:]).strip(), []
+            return found[0], strip_seps(" ".join(words[n:])), []
         if len(found) > 1 and n == 1:
             return None, text, found
     return None, text, []
 
 
+def take_employees(text: str) -> tuple[list[str], str, list[str]]:
+    """Несколько имён подряд через запятую: «максим, Вика Г, Света помочь …»."""
+    text = strip_seps(text)
+    people: list[str] = []
+    rest = text
+    while True:
+        emp, tail, variants = take_employee(rest)
+        if not emp:
+            return people, rest, (variants if not people else [])
+        if emp not in people:
+            people.append(emp)
+        rest = tail
+        # продолжаем, только если дальше снова имя (через запятую или подряд)
+        nxt, _, _ = take_employee(rest)
+        if not nxt:
+            return people, rest, []
+
+
+PENDING: dict[tuple[int, int], dict] = {}
+PENDING_TTL = 600          # сколько секунд ждём уточнения имени
+
+
+def remember_pending(message, raw: str, kind: str) -> None:
+    """Запоминаем команду, в которой имя оказалось неоднозначным."""
+    PENDING[(message.chat.id, message.from_user.id)] = {
+        "text": message.text or "", "raw": raw, "ts": time.time(),
+    }
+
+
 def ask_who(found: list[str], raw: str) -> str:
     if found:
-        return f"Уточните, кто именно: {', '.join(found)}"
+        return (f"Уточните, кто именно: {', '.join(found)}\n"
+                f"<i>Можно просто ответить именем — команду повторять не нужно.</i>")
     return f"Не нашёл сотрудника «{raw}». Известные: {', '.join(EMPLOYEES)}"
 
 
@@ -225,6 +267,24 @@ def parse_date(text: str) -> datetime | None:
     m = re.match(r"через\s+(\d+)\s*(?:дн|день|дня|дней)", t)
     if m:
         return now + timedelta(days=int(m.group(1)))
+    m = re.match(r"^(\d{1,2})\s+([а-я]{3,})\.?(?:\s+(\d{4}))?$", t)
+    if m:
+        stem = m.group(2)[:3]
+        months3 = ("янв фев мар апр мая июн июл авг сен окт ноя дек").split()
+        if stem == "май":
+            stem = "мая"
+        if stem in months3:
+            mo = months3.index(stem) + 1
+            d = int(m.group(1))
+            y = int(m.group(3) or now.year)
+            try:
+                dt = now.replace(year=y, month=mo, day=d, hour=18, minute=0, second=0, microsecond=0)
+            except ValueError:
+                return None
+            if not m.group(3) and dt.date() < now.date():
+                dt = dt.replace(year=y + 1)
+            return dt
+
     m = re.match(r"^(\d{1,2})[.\-/](\d{1,2})(?:[.\-/](\d{2,4}))?$", t)
     if m:
         d, mo = int(m.group(1)), int(m.group(2))
@@ -239,6 +299,20 @@ def parse_date(text: str) -> datetime | None:
             dt = dt.replace(year=y + 1)
         return dt
     return None
+
+
+def parse_number(text: str, as_percent: bool = False) -> float | None:
+    """«20», «20%», «0,2» → 20 при as_percent. Иначе просто число."""
+    t = text.strip().replace(",", ".").replace(" ", "")
+    had_percent = t.endswith("%")
+    t = t.rstrip("%")
+    try:
+        value = float(t)
+    except ValueError:
+        return None
+    if as_percent and not had_percent and 0 < value < 1:
+        value *= 100          # 0,2 — это 20%
+    return value
 
 
 def fmt_date(dt: datetime | str) -> str:
@@ -302,65 +376,70 @@ async def cmd_task(message: Message):
         await message.answer(
             "Как ставить поручение:\n"
             "<code>/task Оля подготовить справку по окладам до 20.10</code>\n\n"
-            "Можно нескольким: <code>/task Оля,Лёша свести данные до 25.10</code>"
+            "Нескольким сразу: <code>/task Максим, Вика Г., Света помочь Оле с отчётом до 19 окт</code>"
         )
         return
 
-    body = raw[1].strip()
+    body = strip_seps(raw[1])
     deadline, body_wo = None, body
-    m = re.search(r"\s+до\s+(\S+)\s*$", body, re.I)
+    m = re.search(r"\s+до\s+(.+?)\s*$", body, re.I)
     if m:
         deadline = parse_date(m.group(1))
         if deadline:
             body_wo = body[:m.start()].strip()
 
-    assignees, what = [], body_wo
-    if "," in body_wo.split()[0] or "," in " ".join(body_wo.split()[:2]):
-        head, _, tail = body_wo.partition(" ")
-        for piece in head.split(","):
-            emp = match_employee(piece)
-            if emp and emp not in assignees:
-                assignees.append(emp)
-        what = tail.strip()
+    assignees, what, variants = take_employees(body_wo)
     if not assignees:
-        emp, what, variants = take_employee(body_wo)
-        if not emp:
-            await message.answer(ask_who(variants, body_wo.split()[0]))
-            return
-        assignees = [emp]
+        remember_pending(message, body_wo.split()[0] if body_wo.split() else "", "task")
+        await message.answer(ask_who(variants, body_wo.split()[0] if body_wo.split() else "?"))
+        return
     if not what:
         await message.answer("Не понял, что поручаем. Пример: <code>/task Оля свести оклады до 20.10</code>")
         return
     if not deadline:
-        await message.answer("Не вижу срока. Добавьте в конце: <code>… до 20.10</code>")
+        await message.answer(
+            "Не вижу срока. Добавьте в конце: <code>… до 20.10</code>, "
+            "<code>… до 19 окт</code> или <code>… до завтра</code>"
+        )
         return
 
-    tid = next_id()
-    data["tasks"].append({
-        "id": tid,
-        "what": what,
-        "who": assignees,
-        "deadline": deadline.strftime("%Y-%m-%d"),
-        "author": uname(message),
-        "chat": message.chat.id,
-        "created": now_msk().strftime("%Y-%m-%d"),
-        "done": False,
-        "warned": False,
-        "overdue_at": "",
-    })
+    created = []
+    for emp in assignees:                      # каждому — своё поручение
+        tid = next_id()
+        data["tasks"].append({
+            "id": tid, "what": what, "who": [emp],
+            "deadline": deadline.strftime("%Y-%m-%d"),
+            "author": uname(message), "chat": message.chat.id,
+            "created": now_msk().strftime("%Y-%m-%d"),
+            "done": False, "warned": False, "overdue_at": "",
+        })
+        created.append((tid, emp))
     save_data()
 
-    sent = await message.answer(
-        f"📌 <b>Поручение №{tid}</b>\n\n{what}\n\n"
-        f"Кому: <b>{', '.join(assignees)}</b>\n"
-        f"Срок: <b>{fmt_date(deadline)}</b> ({(deadline.date() - now_msk().date()).days} дн.)\n"
-        f"Поставил: {uname(message)}\n\n"
-        f"Выполнено: <code>/done {tid}</code>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="✅ Выполнено", callback_data=f"t:done:{tid}"),
-            InlineKeyboardButton(text="📅 +3 дня", callback_data=f"t:post:{tid}"),
-        ]]),
-    )
+    left = (deadline.date() - now_msk().date()).days
+    if len(created) == 1:
+        tid, emp = created[0]
+        sent = await message.answer(
+            f"📌 <b>Поручение №{tid}</b>\n\n{what}\n\n"
+            f"Кому: <b>{emp}</b>\n"
+            f"Срок: <b>{fmt_date(deadline)}</b> ({left} дн.)\n"
+            f"Поставил: {uname(message)}\n\n"
+            f"Выполнено: <code>/done {tid}</code>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="✅ Выполнено", callback_data=f"t:done:{tid}"),
+                InlineKeyboardButton(text="📅 +3 дня", callback_data=f"t:post:{tid}"),
+            ]]),
+        )
+    else:
+        lines = "\n".join(f"<b>№{tid}</b> — {emp}" for tid, emp in created)
+        rows = [[InlineKeyboardButton(text=f"✅ №{tid} {emp}", callback_data=f"t:done:{tid}")]
+                for tid, emp in created]
+        sent = await message.answer(
+            f"📌 <b>Поручений создано: {len(created)}</b>\n\n{what}\n\n{lines}\n\n"
+            f"Срок: <b>{fmt_date(deadline)}</b> ({left} дн.)\n"
+            f"Поставил: {uname(message)}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        )
     try:
         await sent.pin()
     except Exception:
@@ -397,6 +476,41 @@ async def cmd_tasks(message: Message):
     await message.answer(head + "\n\n" + "\n".join(task_line(t) for t in open_tasks))
 
 
+@router.message(Command("closed", "закрытые"))
+async def cmd_closed(message: Message):
+    done = [t for t in data["tasks"] if t["done"]]
+    if not done:
+        await message.answer("Закрытых поручений пока нет.")
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    emp_filter = None
+    if len(parts) > 1:
+        emp_filter, _, _ = take_employee(parts[1])
+        if emp_filter:
+            done = [t for t in done if emp_filter in t["who"]]
+    if not done:
+        await message.answer(f"У {emp_filter} закрытых поручений нет.")
+        return
+
+    done.sort(key=lambda t: t.get("closed_at", ""), reverse=True)
+    in_time = 0
+    lines = []
+    for t in done[:30]:
+        deadline = datetime.strptime(t["deadline"], "%Y-%m-%d").date()
+        closed = datetime.strptime(t.get("closed_at", t["deadline"]), "%Y-%m-%d").date()
+        late = (closed - deadline).days
+        if late <= 0:
+            in_time += 1
+            mark, tail = "✅", "в срок"
+        else:
+            mark, tail = "🟠", f"+{late} дн."
+        lines.append(f"{mark} <b>№{t['id']}</b> {t['what'][:60]}\n"
+                     f"     <i>{', '.join(t['who'])} · закрыто {fmt_date(closed)} · {tail}</i>")
+    head = f"📗 <b>Закрытые поручения" + (f": {emp_filter}" if emp_filter else "") + f"</b>\n"
+    head += f"Всего {len(done)}, в срок {in_time} из {min(len(done), 30)} показанных\n"
+    await message.answer(head + "\n" + "\n".join(lines))
+
+
 @router.message(Command("my", "мои"))
 async def cmd_my_tasks(message: Message):
     me = match_employee(uname(message)) or uname(message)
@@ -406,6 +520,16 @@ async def cmd_my_tasks(message: Message):
         return
     mine.sort(key=lambda t: t["deadline"])
     await message.answer(f"📋 <b>Поручения: {me}</b>\n\n" + "\n".join(task_line(t) for t in mine))
+
+
+def my_name(user_id: int) -> str | None:
+    """Сопоставляет телеграм-аккаунт с сотрудником из списка."""
+    return match_employee(data["users"].get(str(user_id), ""))
+
+
+def may_touch(task: dict, user_id: int) -> bool:
+    """Трогать поручение может руководитель или тот, кому оно поставлено."""
+    return is_admin(user_id) or (my_name(user_id) in task["who"])
 
 
 def close_task(tid: int, who: str) -> str:
@@ -428,18 +552,25 @@ def close_task(tid: int, who: str) -> str:
 async def cmd_done(message: Message):
     remember(message)
     parts = (message.text or "").split()
-    if len(parts) < 2 or not parts[1].isdigit():
+    nums = [p for p in parts[1:] if p.strip(SEPARATORS + "№").isdigit()]
+    if not nums:
         await message.answer("Напишите так: <code>/done 3</code>")
         return
-    await message.answer(close_task(int(parts[1]), uname(message)))
+    out = []
+    for n in nums:
+        tid = int(n.strip(SEPARATORS + "№"))
+        t = next((x for x in data["tasks"] if x["id"] == tid), None)
+        if t and not may_touch(t, message.from_user.id):
+            out.append(f"№{tid}: закрыть может только исполнитель ({', '.join(t['who'])}) или руководитель.")
+        else:
+            out.append(close_task(tid, uname(message)))
+    await message.answer("\n\n".join(out))
 
 
 @router.message(Command("extend", "продлить"))
 async def cmd_postpone(message: Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("Переносить срок может только руководитель.")
-        return
-    m = re.match(r"^\S+\s+(\d+)\s+(?:до\s+)?(\S+)", (message.text or "").strip())
+    remember(message)
+    m = re.match(r"^\S+\s+№?(\d+)\s+(?:до\s+)?(.+)$", (message.text or "").strip())
     if not m:
         await message.answer("Напишите так: <code>/extend 3 до 25.10</code>")
         return
@@ -447,7 +578,10 @@ async def cmd_postpone(message: Message):
     if not t:
         await message.answer("Такого поручения нет.")
         return
-    new_date = parse_date(m.group(2))
+    if not may_touch(t, message.from_user.id):
+        await message.answer(f"Срок меняет исполнитель ({', '.join(t['who'])}) или руководитель.")
+        return
+    new_date = parse_date(m.group(2).strip())
     if not new_date:
         await message.answer("Не понял дату. Пример: <code>/extend 3 до 25.10</code>")
         return
@@ -480,17 +614,17 @@ async def on_task_button(call: CallbackQuery):
     remember(call)
     _, action, tid = call.data.split(":")
     tid = int(tid)
+    t = next((x for x in data["tasks"] if x["id"] == tid), None)
+    if not t:
+        await call.answer("Поручение не найдено")
+        return
+    if not may_touch(t, call.from_user.id):
+        await call.answer(f"Это поручение для {', '.join(t['who'])}", show_alert=True)
+        return
     if action == "done":
         await call.message.answer(close_task(tid, uname(call)))
         await call.answer("Закрыто")
     else:
-        if not is_admin(call.from_user.id):
-            await call.answer("Переносить срок может только руководитель", show_alert=True)
-            return
-        t = next((x for x in data["tasks"] if x["id"] == tid), None)
-        if not t:
-            await call.answer("Поручение не найдено")
-            return
         new_date = datetime.strptime(t["deadline"], "%Y-%m-%d") + timedelta(days=3)
         t["deadline"] = new_date.strftime("%Y-%m-%d")
         t["warned"] = False
@@ -576,39 +710,72 @@ async def cmd_card(message: Message):
     )
 
 
+def kpi_find(card: dict, text: str) -> str | None:
+    """Находит KPI по коду или по названию, даже если написано несколькими словами."""
+    t = _norm(text)
+    if not t:
+        return None
+    if t in card:
+        return t
+    for code, item in card.items():
+        if _norm(code).startswith(t) or t.startswith(_norm(code)):
+            return code
+    for code, item in card.items():
+        name = _norm(item["name"])
+        if name.startswith(t) or t.startswith(name) or t in name:
+            return code
+    first = t.split()[0]
+    for code, item in card.items():
+        if _norm(code).startswith(first) or _norm(item["name"]).startswith(first):
+            return code
+    return None
+
+
+FIELD_RU = {"weight": "вес", "plan": "план", "fact": "факт"}
+
+
 def _kpi_edit(message: Message, field_name: str) -> str:
-    """Общий разбор команд вида /вес Оля проекты 40."""
-    parts = (message.text or "").split()
-    if len(parts) < 4:
+    """Разбор команд вида /weight Оля обращения с портала 20%."""
+    field_name = FIELD_RU.get(field_name, field_name)
+    body = (message.text or "").split(maxsplit=1)
+    if len(body) < 2:
         return (f"Напишите так: <code>/{field_name} Оля проекты 40</code>\n"
                 f"Коды KPI: {', '.join(c for c, *_ in KPI_TEMPLATE)}")
-    emp, rest, variants = take_employee(" ".join(parts[1:]))
+
+    emp, rest, variants = take_employee(body[1])
     if not emp:
-        return ask_who(variants, parts[1])
-    rest_parts = rest.split()
-    if len(rest_parts) < 2:
-        return f"Не хватает кода KPI или значения. Пример: <code>/{field_name} {emp.split()[0]} проекты 40</code>"
-    parts = [parts[0], emp, rest_parts[0], rest_parts[1]]
+        remember_pending(message, body[1].split()[0] if body[1].split() else "", field_name)
+        return ask_who(variants, body[1].split()[0] if body[1].split() else "?")
+
+    words = strip_seps(rest).split()
+    if len(words) < 2:
+        return (f"Не хватает KPI или значения. Пример: "
+                f"<code>/{field_name} {emp.split()[0]} проекты 40</code>")
+
     card = kpi_card(emp)
-    code = parts[2].lower()
-    if code not in card:
-        return f"Нет такого KPI. Есть: {', '.join(card)}"
-    value = parts[3].replace(",", ".")
-    try:
-        num = float(value)
-    except ValueError:
-        return "Последним должно быть число."
+    num = parse_number(words[-1], as_percent=(field_name == "вес"))
+    if num is None:
+        return ("Последним должно быть число: <code>20</code>, <code>20%</code> или <code>0,2</code>."
+                if field_name == "вес" else "Последним должно быть число.")
+
+    code = kpi_find(card, " ".join(words[:-1]))
+    if not code:
+        names = ", ".join(f"{c} ({i['name']})" for c, i in card.items())
+        return (f"Нет такого KPI у {emp}.\nЕсть: {names}\n\n"
+                f"Добавить новый: <code>/addkpi {emp.split()[0]} качество Качество данных</code>")
 
     if field_name == "вес":
         card[code]["weight"] = num
         total_w = sum(i["weight"] for i in card.values())
         save_data()
-        tail = f"\n⚠️ Сумма весов: {total_w:g}% (обычно должно быть 100%)" if abs(total_w - 100) > 0.01 else ""
+        tail = (f"\n⚠️ Сумма весов у {emp}: {total_w:g}% (обычно должно быть 100%)"
+                if abs(total_w - 100) > 0.01 else "")
         return f"Вес «{card[code]['name']}» для {emp}: <b>{num:g}%</b>{tail}"
     if field_name == "план":
         card[code]["plan"] = num
         save_data()
         return f"План «{card[code]['name']}» для {emp}: <b>{num:g}</b>"
+
     card[code]["fact"] = num
     save_data()
     res = kpi_result(card[code])
@@ -616,6 +783,73 @@ def _kpi_edit(message: Message, field_name: str) -> str:
     return (f"Факт «{card[code]['name']}» для {emp}: <b>{num:g}</b> "
             f"(выполнение {res:.0f}%)\nТекущая премия: <b>{total:.1f}%</b>"
             + ("" if complete else " <i>— не всё внесено</i>"))
+
+
+@router.message(Command("addkpi", "новыйkpi"))
+async def cmd_addkpi(message: Message):
+    remember(message)
+    if not is_admin(message.from_user.id):
+        await message.answer("Новые KPI заводят руководители.")
+        return
+    body = (message.text or "").split(maxsplit=1)
+    if len(body) < 2:
+        await message.answer(
+            "Как добавить KPI:\n"
+            "<code>/addkpi Оля качество Качество данных</code>\n\n"
+            "Первое слово после имени — короткий код для команд, дальше название.\n"
+            "Потом задайте вес и план: <code>/weight Оля качество 20</code>"
+        )
+        return
+    emp, rest, variants = take_employee(body[1])
+    if not emp:
+        await message.answer(ask_who(variants, body[1].split()[0]))
+        return
+    words = strip_seps(rest).split()
+    if not words:
+        await message.answer("Не хватает кода KPI. Пример: <code>/addkpi Оля качество Качество данных</code>")
+        return
+
+    code = _norm(words[0]).replace(" ", "")
+    title = " ".join(words[1:]).strip() or words[0].capitalize()
+    card = kpi_card(emp)
+    if code in card:
+        await message.answer(f"KPI «{code}» у {emp} уже есть: {card[code]['name']}")
+        return
+    card[code] = {"name": title, "weight": 0, "plan": 100, "fact": None, "type": "больше"}
+    save_data()
+    total_w = sum(i["weight"] for i in card.values())
+    await message.answer(
+        f"➕ У <b>{emp}</b> новый KPI: <b>{title}</b> (код <code>{code}</code>)\n"
+        f"Вес пока 0, план 100.\n\n"
+        f"<code>/weight {emp.split()[0]} {code} 20</code>\n"
+        f"<code>/plan {emp.split()[0]} {code} 150</code>\n"
+        f"Сумма весов сейчас: {total_w:g}%"
+    )
+
+
+@router.message(Command("delkpi", "удалитьkpi"))
+async def cmd_delkpi(message: Message):
+    remember(message)
+    if not is_admin(message.from_user.id):
+        await message.answer("Удалять KPI могут руководители.")
+        return
+    body = (message.text or "").split(maxsplit=1)
+    if len(body) < 2:
+        await message.answer("Напишите так: <code>/delkpi Оля качество</code>")
+        return
+    emp, rest, variants = take_employee(body[1])
+    if not emp:
+        await message.answer(ask_who(variants, body[1].split()[0]))
+        return
+    card = kpi_card(emp)
+    code = kpi_find(card, strip_seps(rest))
+    if not code:
+        await message.answer(f"Нет такого KPI. Есть: {', '.join(card)}")
+        return
+    name = card.pop(code)["name"]
+    save_data()
+    await message.answer(f"➖ Убрал «{name}» у {emp}. Сумма весов: "
+                         f"{sum(i['weight'] for i in card.values()):g}%")
 
 
 @router.message(Command("weight", "вес"))
@@ -649,15 +883,21 @@ async def cmd_kpi_type(message: Message):
         return
     parts = (message.text or "").split()
     if len(parts) < 4 or parts[3].lower() not in ("больше", "меньше"):
-        await message.answer("Напишите так: <code>/type Оля ошибки меньше</code>\n"
-                             "«больше» — чем больше факт, тем лучше. «меньше» — наоборот.")
+        await message.answer(
+            "Напишите так: <code>/type Оля ошибки меньше</code>\n\n"
+            "Команда задаёт, в какую сторону считать выполнение:\n"
+            "• <b>больше</b> — чем больше факт, тем лучше (обращения, проекты). "
+            "Выполнение = факт ÷ план.\n"
+            "• <b>меньше</b> — чем меньше, тем лучше (ошибки, просрочки). "
+            "Факт в пределах плана даёт 100%, превышение снижает результат."
+        )
         return
     emp, rest, variants = take_employee(" ".join(parts[1:-1]))
     if not emp:
         await message.answer(ask_who(variants, parts[1]))
         return
     card = kpi_card(emp)
-    code = (rest.split() or [""])[0].lower()
+    code = kpi_find(card, strip_seps(rest)) or ""
     if code not in card:
         await message.answer(f"Нет такого KPI. Есть: {', '.join(card)}")
         return
@@ -1215,15 +1455,18 @@ HELP = (
     "🤖 <b>Бот отдела C&amp;B</b>\n\n"
     "<b>Поручения</b>\n"
     "/task — поставить: <code>/task Оля свести оклады до 20.10</code>\n"
-    "/tasks — все открытые · /my — свои\n"
-    "/done 3 — закрыть · /extend 3 до 25.10 · /cancel 3\n\n"
+    "    нескольким сразу: <code>/task Максим, Вика Г., Света отчёт до 19 окт</code>\n"
+    "/tasks — открытые · /my — свои · /closed — закрытые\n"
+    "/done 3 — закрыть · /extend 3 до 25.10 · /cancel 3\n"
+    "<i>Закрыть и продлить может исполнитель или руководитель.</i>\n\n"
     "<b>Премии и KPI</b>\n"
     "/card — сводка · <code>/card Оля</code> — подробно\n"
     "/fact — внести факт: <code>/fact Оля проекты 95</code>\n"
-    "/weight — вес: <code>/weight Оля проекты 40</code>\n"
+    "/weight — вес: <code>/weight Оля проекты 20%</code>\n"
     "/plan — план: <code>/plan Оля обращения 150</code>\n"
-    "/type — направление: <code>/type Оля ошибки меньше</code>\n"
-    "/bonus Оля — расчёт одному · /bonuses — по всем\n"
+    "/type — куда считать: <code>/type Оля ошибки меньше</code>\n"
+    "/addkpi — новый KPI: <code>/addkpi Оля качество Качество данных</code>\n"
+    "/delkpi — убрать KPI · /bonus Оля · /bonuses — по всем\n"
     "/close — зафиксировать месяц · /history Оля\n\n"
     "<b>Отсутствия</b>\n"
     "/vac — отпуск: <code>/vac Оля 10.11-24.11</code> · /vacations\n"
@@ -1235,8 +1478,8 @@ HELP = (
     "/game — «5 букв» · /score — счёт\n"
     "/ask — спросить помощника · /reset — очистить контекст\n"
     "/whoami — мои права · /chatid — id чата\n\n"
-    "<i>Напоминаю сам: о сроках поручений и просрочках, табеле 15-го и в конце месяца, "
-    "KPI 1-го числа, отпусках за две недели и днях рождения.</i>"
+    "<i>Имя можно писать как угодно: «Оля», «вика к», «кудряшова». "
+    "Если неоднозначно — просто ответьте именем, команда повторится сама.</i>"
 )
 
 
@@ -1253,6 +1496,25 @@ async def cmd_help(message: Message):
 @router.message(F.text & ~F.text.startswith("/"))
 async def on_text(message: Message):
     remember(message)
+    text_raw = (message.text or "").strip()
+
+    # 1. ждём уточнения имени после «Уточните, кто именно…»
+    key = (message.chat.id, message.from_user.id)
+    pend = PENDING.get(key)
+    if pend:
+        if time.time() - pend["ts"] > PENDING_TTL:
+            PENDING.pop(key, None)
+        else:
+            emp = match_employee(text_raw)
+            if emp:
+                PENDING.pop(key, None)
+                new_text = re.sub(re.escape(pend["raw"]), emp, pend["text"], count=1)
+                cmd = new_text.split()[0].lstrip("/").split("@")[0].lower()
+                handler = REDISPATCH.get(cmd)
+                if handler:
+                    await handler(message.model_copy(update={"text": new_text}))
+                    return
+
     game = games.get(message.chat.id)
     text = (message.text or "").strip()
     if not game or game.finished or not WORD_RE.fullmatch(text):
@@ -1294,6 +1556,13 @@ async def on_text(message: Message):
                              f"\n\n😔 Попытки кончились. Слово: <b>{game.secret.upper()}</b>")
         return
     await message.answer(render_board(game) + "\n\n" + render_letters(game))
+
+REDISPATCH = {
+    "task": cmd_task, "поручение": cmd_task, "задача": cmd_task,
+    "weight": cmd_weight, "вес": cmd_weight,
+    "plan": cmd_plan, "план": cmd_plan,
+    "fact": cmd_fact, "факт": cmd_fact,
+}
 
 # ---------------------------------------------------------------- расписание
 
