@@ -49,7 +49,7 @@ MORNING_HOUR = 10           # час утренних напоминаний (М
 THANKS_SUMMARY_WEEKDAY = 4  # пятница — итоги благодарностей
 THANKS_SUMMARY_HOUR = 17
 
-VERSION = "2026-10-16 · 18:20"   # видно в логах и по команде /version
+VERSION = "2026-10-16 · 18:45"   # видно в логах и по команде /version
 
 MSK = timezone(timedelta(hours=3))
 BASE_DIR = Path(__file__).resolve().parent
@@ -184,8 +184,30 @@ def take_employee(text: str) -> tuple[str | None, str, list[str]]:
 
 
 def take_employees(text: str) -> tuple[list[str], str, list[str]]:
-    """Несколько имён подряд через запятую: «максим, Вика Г, Света помочь …»."""
+    """Несколько имён подряд: «Оля,Лёша,Света текст» или «максим, Вика Г, Света текст»."""
     text = strip_seps(text)
+    if not text:
+        return [], "", []
+
+    # список через запятую — последний кусок содержит имя и сам текст
+    if "," in text:
+        chunks = [c for c in text.split(",")]
+        people, ok = [], True
+        for piece in chunks[:-1]:
+            emp = match_employee(piece)
+            if not emp:
+                ok = False
+                break
+            if emp not in people:
+                people.append(emp)
+        if ok and people:
+            emp, rest, _ = take_employee(chunks[-1])
+            if emp:
+                if emp not in people:
+                    people.append(emp)
+                return people, strip_seps(rest), []
+
+    # имена подряд без запятых
     people: list[str] = []
     rest = text
     while True:
@@ -195,7 +217,6 @@ def take_employees(text: str) -> tuple[list[str], str, list[str]]:
         if emp not in people:
             people.append(emp)
         rest = tail
-        # продолжаем, только если дальше снова имя (через запятую или подряд)
         nxt, _, _ = take_employee(rest)
         if not nxt:
             return people, rest, []
@@ -696,6 +717,19 @@ async def cmd_task(message: Message):
             if m.end() >= len(body.rstrip(". ")) - 1:
                 body_wo = body[:m.start()].strip(" .,")
             break
+
+    if deadline is None:
+        # слова «сегодня», «завтра», «через 3 дня» без «до» — тоже срок
+        m = re.search(r"\b(сегодня|завтра|послезавтра|через\s+\d+\s*дн\w*)\b", body, re.I)
+        if m:
+            deadline = parse_date(m.group(1))
+        else:
+            # дата в самом конце строки без предлога
+            m = re.search(r"(\d{1,2}[.\-/]\d{1,2}(?:[.\-/]\d{2,4})?"
+                          r"|\d{1,2}\s+[а-я]{3,}\.?)\s*\.?\s*$", body, re.I)
+            if m and parse_date(m.group(1)):
+                deadline = parse_date(m.group(1))
+                body_wo = body[:m.start()].strip(" .,")
 
     assignees, what, variants = take_employees(body_wo)
     if not assignees:
@@ -1733,7 +1767,10 @@ AI_SYSTEM = (
     "сводится к действию — верни только команды, каждую с новой строки, без пояснений, "
     "без кавычек и без markdown. Бот выполнит их сам от имени написавшего.\n\n"
     "Команды бота:\n"
-    "/task Имя текст поручения до ДД.ММ — поставить поручение (нескольким: имена через запятую)\n"
+    "/task Имя текст поручения до ДД.ММ — поставить поручение\n"
+    "  нескольким сразу: /task Оля, Лёша, Света текст до ДД.ММ (имена через запятую)\n"
+    "  всем семерым — перечисли всех поимённо\n"
+    "  срок обязателен: «до 25.10», «до 19 окт», «до завтра», «до сегодня»\n"
     "/done N — закрыть поручение · /extend N до ДД.ММ — продлить · /reopen N — вернуть в работу\n"
     "/tasks [Имя] — открытые поручения · /closed [Имя] — закрытые\n"
     "/addkpi Имя код Название — новый KPI (код — ОДНО слово латиницей или кириллицей)\n"
