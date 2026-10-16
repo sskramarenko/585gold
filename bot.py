@@ -49,7 +49,7 @@ MORNING_HOUR = 10           # час утренних напоминаний (М
 THANKS_SUMMARY_WEEKDAY = 4  # пятница — итоги благодарностей
 THANKS_SUMMARY_HOUR = 17
 
-VERSION = "2026-10-16 · 17:15"   # видно в логах и по команде /version
+VERSION = "2026-10-16 · 18:20"   # видно в логах и по команде /version
 
 MSK = timezone(timedelta(hours=3))
 BASE_DIR = Path(__file__).resolve().parent
@@ -380,22 +380,62 @@ def fmt_date(dt: datetime | str) -> str:
 router = Router()
 
 
+def extract_commands(text: str) -> list[str]:
+    """Строки-команды из текста: и от человека, и из ответа ИИ."""
+    out = []
+    for line in (text or "").splitlines():
+        line = line.strip().strip("`").strip()
+        if line.startswith("/") and len(line) > 2:
+            out.append(line)
+    return out
+
+
+async def run_commands(message: Message, lines: list[str], limit: int = 12) -> int:
+    """Выполняет команды по очереди от имени написавшего."""
+    done_count = 0
+    for line in lines[:limit]:
+        name = line.split()[0].lstrip("/").split("@")[0].lower()
+        if name in ("ask", "спроси", "ai"):      # чтобы не зациклиться
+            continue
+        handler = COMMANDS.get(name)
+        if not handler:
+            await message.answer(f"⚠️ Команду <code>/{name}</code> не знаю, пропустил.")
+            continue
+        try:
+            await handler(message.model_copy(update={"text": line, "entities": []}))
+            done_count += 1
+        except Exception as e:
+            log.warning("Ошибка в команде %s: %s", line, e)
+            await message.answer(f"⚠️ <code>{line[:60]}</code> — не получилось: {e}")
+    if len(lines) > limit:
+        await message.answer(f"<i>Выполнил первые {limit} команд, остальное пришлите отдельно.</i>")
+    return done_count
+
+
 async def access_guard(handler, event, ctx):
-    """Пускает только свои чаты и своих людей."""
+    """Пускает только свои чаты и своих людей, а пачку команд выполняет целиком."""
     message = event if isinstance(event, Message) else event.message
     chat, user = message.chat, event.from_user
     text = (message.text or "") if isinstance(event, Message) else ""
-    if text.startswith("/chatid") or text.startswith("/whoami"):
-        return await handler(event, ctx)
-    if not ALLOWED_CHATS:
-        return await handler(event, ctx)
-    if chat.type in ("group", "supergroup"):
-        if chat.id not in ALLOWED_CHATS:
-            log.warning("Чужой чат %s — игнорирую", chat.id)
+
+    # проверка доступа
+    if not (text.startswith("/chatid") or text.startswith("/whoami") or not ALLOWED_CHATS):
+        if chat.type in ("group", "supergroup"):
+            if chat.id not in ALLOWED_CHATS:
+                log.warning("Чужой чат %s — игнорирую", chat.id)
+                return None
+        elif str(user.id) not in data["users"]:
+            log.warning("Чужая личка от %s — игнорирую", user.id)
             return None
-    elif str(user.id) not in data["users"]:
-        log.warning("Чужая личка от %s — игнорирую", user.id)
-        return None
+
+    # несколько команд в одном сообщении — выполняем все по очереди
+    if isinstance(event, Message) and text:
+        lines = extract_commands(text)
+        if len(lines) > 1:
+            remember(event)
+            await run_commands(event, lines)
+            return None
+
     return await handler(event, ctx)
 
 
@@ -1687,12 +1727,28 @@ async def cmd_scores(message: Message):
 # ---------------------------------------------------------------- ИИ-помощник
 
 AI_SYSTEM = (
-    "Ты помощник отдела компенсаций и льгот (C&B) российской розничной компании. "
-    "Отвечай кратко и по делу, на русском. Помогаешь с вопросами по оплате труда, "
-    "премированию, ТК РФ, расчётам, формулировкам документов и аналитике. "
-    "Если вопрос требует точных норм закона — называй статью, но предупреждай, "
-    "что решение нужно сверить с юристом."
+    "Ты помощник отдела компенсаций и льгот (C&B) российской розничной компании, "
+    "встроенный в телеграм-бот. Отвечай кратко, по делу, на русском.\n\n"
+    "Ты умеешь не только отвечать, но и ВЫПОЛНЯТЬ действия в боте. Если просьба "
+    "сводится к действию — верни только команды, каждую с новой строки, без пояснений, "
+    "без кавычек и без markdown. Бот выполнит их сам от имени написавшего.\n\n"
+    "Команды бота:\n"
+    "/task Имя текст поручения до ДД.ММ — поставить поручение (нескольким: имена через запятую)\n"
+    "/done N — закрыть поручение · /extend N до ДД.ММ — продлить · /reopen N — вернуть в работу\n"
+    "/tasks [Имя] — открытые поручения · /closed [Имя] — закрытые\n"
+    "/addkpi Имя код Название — новый KPI (код — ОДНО слово латиницей или кириллицей)\n"
+    "/weight Имя код 30% · /plan Имя код 200 · /fact Имя код 180 · /type Имя код меньше\n"
+    "/delkpi Имя код · /card [Имя] · /bonuses · /close — зафиксировать месяц\n"
+    "/vac Имя ДД.ММ-ДД.ММ — отпуск · /dayoff ДД.ММ причина — отгул\n"
+    "/thanks Имя за что — благодарность · /rating · /bd Имя ДД.ММ\n\n"
+    "Сотрудники: Сергей, Максим, Вика Г., Вика К., Света, Лёша, Оля.\n"
+    "Важно: в /addkpi код — одно слово (например «обращения»), а название — остальное. "
+    "Дальше в /weight, /plan, /fact используй именно этот код.\n\n"
+    "Если вопрос требует объяснения, а не действия (нормы ТК, расчёты, формулировки) — "
+    "просто ответь текстом, без команд. Если нужны точные нормы закона, называй статью "
+    "и предупреждай, что решение стоит сверить с юристом."
 )
+
 ai_history: dict[int, list] = {}
 
 
@@ -1802,6 +1858,17 @@ async def cmd_ai(message: Message):
         return
     thinking = await message.answer("🤔 Думаю…")
     answer = await ask_ai(parts[1].strip(), message.chat.id)
+
+    cmds = extract_commands(answer)
+    if cmds:
+        preview = "\n".join(f"<code>{c}</code>" for c in cmds[:12])
+        try:
+            await thinking.edit_text(f"🤖 Выполняю от вашего имени:\n{preview}")
+        except Exception:
+            await message.answer(f"🤖 Выполняю от вашего имени:\n{preview}")
+        await run_commands(message, cmds)
+        return
+
     try:
         await thinking.edit_text(answer[:4000])
     except Exception:
@@ -1842,7 +1909,9 @@ HELP = (
     "/bd — день рождения: <code>/bd Оля 12.03</code> · /bd — список\n\n"
     "<b>Разное</b>\n"
     "/game — «5 букв» · /score — счёт\n"
-    "/ask — спросить помощника · /reset — очистить контекст\n"
+    "/ask — спросить помощника, он сам выполнит нужные команды\n"
+    "/reset — очистить контекст помощника\n"
+    "<i>Несколько команд можно слать одним сообщением, каждую с новой строки.</i>\n"
     "/whoami — мои права · /chatid — id чата\n"
     "/iam Вика Г. — представиться · /team — кого бот узнаёт\n"
     "/export — резервная копия данных · /import — восстановить\n\n"
@@ -1930,6 +1999,40 @@ REDISPATCH = {
     "weight": cmd_weight, "вес": cmd_weight,
     "plan": cmd_plan, "план": cmd_plan,
     "fact": cmd_fact, "факт": cmd_fact,
+}
+
+# Все команды, которые можно выполнить пачкой или от имени ИИ
+COMMANDS = {
+    "task": cmd_task, "поручение": cmd_task, "задача": cmd_task,
+    "tasks": cmd_tasks, "задачи": cmd_tasks, "поручения": cmd_tasks,
+    "my": cmd_my_tasks, "мои": cmd_my_tasks,
+    "closed": cmd_closed, "закрытые": cmd_closed,
+    "done": cmd_done, "готово": cmd_done,
+    "extend": cmd_postpone, "продлить": cmd_postpone,
+    "reopen": cmd_reopen, "вернуть": cmd_reopen,
+    "cancel": cmd_cancel_task, "снять": cmd_cancel_task,
+    "card": cmd_card, "kpi": cmd_card, "карта": cmd_card,
+    "weight": cmd_weight, "вес": cmd_weight,
+    "plan": cmd_plan, "план": cmd_plan,
+    "fact": cmd_fact, "факт": cmd_fact,
+    "type": cmd_kpi_type, "тип": cmd_kpi_type,
+    "addkpi": cmd_addkpi, "новыйkpi": cmd_addkpi,
+    "delkpi": cmd_delkpi, "удалитьkpi": cmd_delkpi,
+    "bonus": cmd_premium_one, "премия": cmd_premium_one,
+    "bonuses": cmd_premiums, "премии": cmd_premiums,
+    "close": cmd_close_month, "закрыть": cmd_close_month,
+    "history": cmd_history, "история": cmd_history,
+    "vac": cmd_vacation, "отпуск": cmd_vacation,
+    "vacations": cmd_vacations, "отпуска": cmd_vacations,
+    "dayoff": cmd_dayoff, "отгул": cmd_dayoff,
+    "dayoffs": cmd_dayoffs, "отгулы": cmd_dayoffs,
+    "thanks": cmd_thanks, "спасибо": cmd_thanks,
+    "rating": cmd_thanks_board, "рейтинг": cmd_thanks_board,
+    "bd": cmd_birthday, "др": cmd_birthday,
+    "iam": cmd_iam, "bind": cmd_bind, "team": cmd_team,
+    "export": cmd_export, "import": cmd_import,
+    "game": cmd_game, "игра": cmd_game, "score": cmd_scores,
+    "version": cmd_version, "whoami": cmd_whoami, "help": cmd_help,
 }
 
 # ---------------------------------------------------------------- память в телеграме
