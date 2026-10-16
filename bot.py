@@ -49,7 +49,7 @@ MORNING_HOUR = 10           # час утренних напоминаний (М
 THANKS_SUMMARY_WEEKDAY = 4  # пятница — итоги благодарностей
 THANKS_SUMMARY_HOUR = 17
 
-VERSION = "2026-10-16 · 18:45"   # видно в логах и по команде /version
+VERSION = "2026-10-16 · 19:10"   # видно в логах и по команде /version
 
 MSK = timezone(timedelta(hours=3))
 BASE_DIR = Path(__file__).resolve().parent
@@ -431,6 +431,11 @@ async def run_commands(message: Message, lines: list[str], limit: int = 12) -> i
     if len(lines) > limit:
         await message.answer(f"<i>Выполнил первые {limit} команд, остальное пришлите отдельно.</i>")
     return done_count
+
+
+DANGEROUS = {"cancel", "снять", "delkpi", "удалитьkpi", "close", "закрыть",
+             "import", "восстановить", "done", "готово"}
+AI_PENDING: dict[str, dict] = {}
 
 
 async def access_guard(handler, event, ctx):
@@ -1763,30 +1768,67 @@ async def cmd_scores(message: Message):
 AI_SYSTEM = (
     "Ты помощник отдела компенсаций и льгот (C&B) российской розничной компании, "
     "встроенный в телеграм-бот. Отвечай кратко, по делу, на русском.\n\n"
-    "Ты умеешь не только отвечать, но и ВЫПОЛНЯТЬ действия в боте. Если просьба "
-    "сводится к действию — верни только команды, каждую с новой строки, без пояснений, "
-    "без кавычек и без markdown. Бот выполнит их сам от имени написавшего.\n\n"
-    "Команды бота:\n"
-    "/task Имя текст поручения до ДД.ММ — поставить поручение\n"
-    "  нескольким сразу: /task Оля, Лёша, Света текст до ДД.ММ (имена через запятую)\n"
-    "  всем семерым — перечисли всех поимённо\n"
+    "Ты умеешь выполнять действия. Если просьба сводится к действию — верни ТОЛЬКО команды, "
+    "каждую с новой строки, без пояснений, кавычек и markdown. Бот выполнит их от имени "
+    "написавшего.\n\n"
+    "ГЛАВНОЕ ПРАВИЛО: номера поручений бери из раздела ТЕКУЩЕЕ СОСТОЯНИЕ ниже. "
+    "Никогда не придумывай номера. Если из просьбы непонятно, о каком поручении речь, "
+    "или подходящих несколько — не выполняй команду, а переспроси обычным текстом, "
+    "перечислив кандидатов с номерами.\n\n"
+    "Команды и их точный смысл:\n"
+    "/cancel N — ОТМЕНИТЬ, убрать, удалить поручение совсем (оно исчезает из списка)\n"
+    "/done N — отметить ВЫПОЛНЕННЫМ (работа сделана)\n"
+    "/reopen N — вернуть УЖЕ ЗАКРЫТОЕ поручение обратно в работу\n"
+    "/extend N до ДД.ММ — перенести срок\n"
+    "/task Имя текст до ДД.ММ — поставить поручение\n"
+    "  нескольким: /task Оля, Лёша, Света текст до ДД.ММ\n"
+    "  всем — перечисли всех семерых поимённо\n"
     "  срок обязателен: «до 25.10», «до 19 окт», «до завтра», «до сегодня»\n"
-    "/done N — закрыть поручение · /extend N до ДД.ММ — продлить · /reopen N — вернуть в работу\n"
     "/tasks [Имя] — открытые поручения · /closed [Имя] — закрытые\n"
-    "/addkpi Имя код Название — новый KPI (код — ОДНО слово латиницей или кириллицей)\n"
+    "/addkpi Имя код Название — новый KPI (код — ОДНО слово)\n"
     "/weight Имя код 30% · /plan Имя код 200 · /fact Имя код 180 · /type Имя код меньше\n"
     "/delkpi Имя код · /card [Имя] · /bonuses · /close — зафиксировать месяц\n"
     "/vac Имя ДД.ММ-ДД.ММ — отпуск · /dayoff ДД.ММ причина — отгул\n"
     "/thanks Имя за что — благодарность · /rating · /bd Имя ДД.ММ\n\n"
-    "Сотрудники: Сергей, Максим, Вика Г., Вика К., Света, Лёша, Оля.\n"
-    "Важно: в /addkpi код — одно слово (например «обращения»), а название — остальное. "
-    "Дальше в /weight, /plan, /fact используй именно этот код.\n\n"
+    "Не путай: «отмени» и «убери» — это /cancel, а не /done и не /reopen. "
+    "«Сделано», «закрой», «выполнено» — это /done. "
+    "«Верни в работу», «переоткрой» — это /reopen.\n\n"
+    "Сотрудники: Сергей, Максим, Вика Г., Вика К., Света, Лёша, Оля.\n\n"
     "Если вопрос требует объяснения, а не действия (нормы ТК, расчёты, формулировки) — "
-    "просто ответь текстом, без команд. Если нужны точные нормы закона, называй статью "
-    "и предупреждай, что решение стоит сверить с юристом."
+    "ответь текстом, без команд. Для норм закона называй статью и предупреждай, "
+    "что решение стоит сверить с юристом."
 )
 
 ai_history: dict[int, list] = {}
+
+
+def current_state_text() -> str:
+    """Короткая сводка состояния — чтобы ИИ не выдумывал номера и коды."""
+    today = now_msk()
+    weekday = ("понедельник вторник среда четверг пятница суббота воскресенье").split()[today.weekday()]
+    lines = [f"СЕГОДНЯ: {today.strftime('%d.%m.%Y')}, {weekday}."]
+
+    open_tasks = sorted((t for t in data["tasks"] if not t["done"]), key=lambda t: t["deadline"])
+    if open_tasks:
+        lines.append("\nОТКРЫТЫЕ ПОРУЧЕНИЯ (номер | кому | срок | текст):")
+        for t in open_tasks[:30]:
+            lines.append(f"  {t['id']} | {', '.join(t['who'])} | {fmt_date(t['deadline'])} | {t['what'][:70]}")
+    else:
+        lines.append("\nОткрытых поручений нет.")
+
+    closed = [t for t in data["tasks"] if t["done"]]
+    if closed:
+        lines.append("ЗАКРЫТЫЕ (номер | кому | текст):")
+        for t in sorted(closed, key=lambda x: -x["id"])[:10]:
+            lines.append(f"  {t['id']} | {', '.join(t['who'])} | {t['what'][:60]}")
+
+    if data.get("kpi"):
+        lines.append("\nKPI по сотрудникам (коды для команд):")
+        for emp, card in data["kpi"].items():
+            codes = ", ".join(f"{c} (вес {i['weight']:g}%)" for c, i in card.items())
+            lines.append(f"  {emp}: {codes}")
+
+    return "\n".join(lines)
 
 
 _giga_token = {"value": "", "until": 0.0}
@@ -1823,23 +1865,24 @@ async def ask_ai(question: str, chat_id: int) -> str:
     del history[:-8]
 
     try:
+        system_now = AI_SYSTEM + "\n\n=== ТЕКУЩЕЕ СОСТОЯНИЕ ===\n" + current_state_text()
         if AI_PROVIDER == "gigachat":
             token = await gigachat_token()
             url = (AI_BASE_URL or "https://api.giga.chat/v1") + "/chat/completions"
             headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
             payload = {"model": AI_MODEL or "GigaChat-2", "max_tokens": 800,
-                       "messages": [{"role": "system", "content": AI_SYSTEM}] + history}
+                       "messages": [{"role": "system", "content": system_now}] + history}
         elif AI_PROVIDER == "anthropic":
             url = (AI_BASE_URL or "https://api.anthropic.com") + "/v1/messages"
             headers = {"x-api-key": AI_KEY, "anthropic-version": "2023-06-01",
                        "content-type": "application/json"}
             payload = {"model": AI_MODEL or "claude-haiku-5-5", "max_tokens": 800,
-                       "system": AI_SYSTEM, "messages": history}
+                       "system": system_now, "messages": history}
         else:
             url = (AI_BASE_URL or "https://api.openai.com/v1") + "/chat/completions"
             headers = {"Authorization": f"{AI_AUTH_SCHEME} {AI_KEY}", "Content-Type": "application/json"}
             payload = {"model": AI_MODEL or "gpt-4o-mini", "max_tokens": 800,
-                       "messages": [{"role": "system", "content": AI_SYSTEM}] + history}
+                       "messages": [{"role": "system", "content": system_now}] + history}
 
         conn = aiohttp.TCPConnector(ssl=False) if AI_INSECURE else None
         async with aiohttp.ClientSession(connector=conn) as s:
@@ -1899,6 +1942,24 @@ async def cmd_ai(message: Message):
     cmds = extract_commands(answer)
     if cmds:
         preview = "\n".join(f"<code>{c}</code>" for c in cmds[:12])
+        risky = [c for c in cmds
+                 if c.split()[0].lstrip("/").split("@")[0].lower() in DANGEROUS]
+
+        if risky:
+            key = str(now_msk().timestamp())[-8:]
+            AI_PENDING[key] = {"cmds": cmds, "msg": message, "user": message.from_user.id}
+            text = (f"⚠️ <b>Это изменит или удалит данные. Выполнить?</b>\n\n{preview}\n\n"
+                    f"<i>Проверьте номера поручений — /tasks покажет актуальные.</i>")
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="✅ Да, выполнить", callback_data=f"ai:ok:{key}"),
+                InlineKeyboardButton(text="✖️ Отмена", callback_data=f"ai:no:{key}"),
+            ]])
+            try:
+                await thinking.edit_text(text, reply_markup=kb)
+            except Exception:
+                await message.answer(text, reply_markup=kb)
+            return
+
         try:
             await thinking.edit_text(f"🤖 Выполняю от вашего имени:\n{preview}")
         except Exception:
@@ -1910,6 +1971,25 @@ async def cmd_ai(message: Message):
         await thinking.edit_text(answer[:4000])
     except Exception:
         await message.answer(answer[:4000])
+
+
+@router.callback_query(F.data.startswith("ai:"))
+async def on_ai_confirm(call: CallbackQuery):
+    _, verdict, key = call.data.split(":", 2)
+    item = AI_PENDING.pop(key, None)
+    if not item:
+        await call.answer("Это предложение уже неактуально")
+        return
+    if call.from_user.id != item["user"]:
+        await call.answer("Решает тот, кто спрашивал", show_alert=True)
+        return
+    if verdict == "no":
+        await call.message.edit_text("✖️ Отменено, ничего не тронул.")
+        await call.answer()
+        return
+    await call.message.edit_text("✅ Выполняю…")
+    await run_commands(item["msg"], item["cmds"])
+    await call.answer()
 
 
 @router.message(Command("reset", "забудь"))
