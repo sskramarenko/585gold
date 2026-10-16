@@ -204,6 +204,7 @@ DEFAULT_DATA = {
     "users": {},          # user_id -> имя в телеграме
     "tg": {},             # user_id -> @ник
     "bind": {},           # user_id -> сотрудник из списка
+    "nicks": {},          # @ник -> сотрудник (ждём, пока он напишет)
     "chats": [],          # где бот прописан
     "done": {},           # отметки «уже напоминал»
     "next_id": 1,
@@ -252,7 +253,8 @@ def remember(obj) -> None:
         if u.username:
             data["tg"][uid] = u.username
         if uid not in data["bind"]:         # пробуем узнать человека сами
-            guess = (match_employee(u.username or "")
+            guess = (data.get("nicks", {}).get((u.username or "").lower())
+                     or match_employee(u.username or "")
                      or match_employee(f"{u.first_name or ''} {u.last_name or ''}")
                      or match_employee(u.first_name or ""))
             if guess:
@@ -403,30 +405,88 @@ async def cmd_iam(message: Message):
 
 @router.message(Command("bind"))
 async def cmd_bind(message: Message):
-    """Руководитель привязывает чужой аккаунт: /bind @nick Вика Г."""
+    """Привязка чужого аккаунта: ответом на сообщение, упоминанием, @ником или id."""
     remember(message)
     if not is_admin(message.from_user.id):
         await message.answer("Привязывать чужие аккаунты могут руководители.")
         return
-    body = (message.text or "").split(maxsplit=2)
-    if len(body) < 3:
-        await message.answer("Напишите так: <code>/bind @Viktoriia_GVV Вика Г.</code>")
-        return
-    nick = body[1].lstrip("@").strip()
-    emp, _, variants = take_employee(body[2])
-    if not emp:
-        await message.answer(ask_who(variants, body[2]))
-        return
-    uid = next((u for u, n in data["tg"].items() if n.lower() == nick.lower()), None)
-    if not uid:
+
+    body = (message.text or "").split(maxsplit=1)
+    target_id, target_label = None, ""
+
+    # 1. команда отправлена ответом на сообщение человека — самый надёжный способ
+    if message.reply_to_message and message.reply_to_message.from_user:
+        u = message.reply_to_message.from_user
+        target_id = u.id
+        target_label = f"@{u.username}" if u.username else (u.first_name or str(u.id))
+        data["users"][str(u.id)] = u.first_name or u.username or "Коллега"
+        if u.username:
+            data["tg"][str(u.id)] = u.username
+
+    # 2. упоминание человека без ника — телеграм прикладывает его id
+    if target_id is None:
+        for ent in (message.entities or []):
+            if ent.type == "text_mention" and ent.user:
+                target_id = ent.user.id
+                target_label = ent.user.first_name or str(ent.user.id)
+                data["users"][str(target_id)] = ent.user.first_name or "Коллега"
+                if ent.user.username:
+                    data["tg"][str(target_id)] = ent.user.username
+                break
+
+    if len(body) < 2:
         await message.answer(
-            f"Пока не видел @{nick} в этом чате — пусть напишет любое сообщение, "
-            f"и повторите команду. Либо он сам: <code>/iam {emp}</code>"
+            "Три способа привязать человека:\n\n"
+            "1. Ответьте этой командой на любое его сообщение: <code>/bind Лёша</code>\n"
+            "2. <code>/bind @ник Лёша</code> — если у него есть ник\n"
+            "3. <code>/bind 123456789 Лёша</code> — по id (его покажет /whoami)\n\n"
+            "Либо он сам один раз напишет <code>/iam Лёша</code>."
         )
         return
-    data["bind"][uid] = emp
+
+    rest = body[1]
+    # 3. первым словом может идти @ник или числовой id
+    if target_id is None:
+        first = rest.split()[0] if rest.split() else ""
+        if first.lstrip("@").isdigit():
+            target_id = int(first.lstrip("@"))
+            target_label = first
+            rest = rest[len(first):]
+        elif first.startswith("@"):
+            nick = first.lstrip("@")
+            uid = next((u for u, n in data["tg"].items() if n.lower() == nick.lower()), None)
+            rest = rest[len(first):]
+            if uid:
+                target_id, target_label = int(uid), f"@{nick}"
+            else:
+                emp_guess, _, variants = take_employee(rest)
+                if not emp_guess:
+                    await message.answer(ask_who(variants, rest.strip() or "?"))
+                    return
+                data["nicks"][nick.lower()] = emp_guess
+                save_data()
+                await message.answer(
+                    f"Запомнил: @{nick} — это <b>{emp_guess}</b>.\n\n"
+                    f"Привязка включится, как только он напишет в чат хоть что-нибудь "
+                    f"(id по нику Telegram узнать не даёт).\n"
+                    f"Хотите сразу — ответьте командой <code>/bind {emp_guess}</code> "
+                    f"на любое его сообщение."
+                )
+                return
+    else:
+        # убираем упоминание из текста, чтобы осталось только имя сотрудника
+        first = rest.split()[0] if rest.split() else ""
+        if first.startswith("@") or first.lstrip("@").isdigit():
+            rest = rest[len(first):]
+
+    emp, _, variants = take_employee(rest)
+    if not emp:
+        await message.answer(ask_who(variants, rest.strip() or "?"))
+        return
+
+    data["bind"][str(target_id)] = emp
     save_data()
-    await message.answer(f"@{nick} — это <b>{emp}</b>, запомнил.")
+    await message.answer(f"{target_label or target_id} — это <b>{emp}</b>, запомнил.")
 
 
 @router.message(Command("team", "кто_есть"))
@@ -439,7 +499,11 @@ async def cmd_team(message: Message):
             nick = data["tg"].get(uid)
             lines.append(f"✅ <b>{emp}</b>" + (f" — @{nick}" if nick else f" — {data['users'].get(uid, '')}"))
         else:
-            lines.append(f"⬜ <b>{emp}</b> — аккаунт не привязан")
+            waiting = [n for n, e in data.get("nicks", {}).items() if e == emp]
+            if waiting:
+                lines.append(f"🕗 <b>{emp}</b> — @{waiting[0]}, ждём первого сообщения")
+            else:
+                lines.append(f"⬜ <b>{emp}</b> — аккаунт не привязан")
     lines.append("\n<i>Непривязанный не сможет сам закрыть своё поручение.</i>\n"
                  "Привязать: <code>/iam Вика Г.</code> или <code>/bind @ник Вика Г.</code>")
     await message.answer("\n".join(lines))
@@ -613,7 +677,7 @@ def my_name(user_id: int) -> str | None:
         return bound
     nick = data.get("tg", {}).get(uid)
     if nick:
-        emp = match_employee(nick)
+        emp = data.get("nicks", {}).get(nick.lower()) or match_employee(nick)
         if emp:
             return emp
     return match_employee(data["users"].get(uid, ""))
